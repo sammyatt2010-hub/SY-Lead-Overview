@@ -217,11 +217,34 @@ def source_list() -> List[Dict[str, str]]:
     ]
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+def _clean_token(raw: str) -> str:
+    """Forgives copy-paste slips: stray quotes, spaces, 'Bearer ' or 'token ' in front."""
+    t = (raw or "").strip().strip('"').strip("'").strip()
+    for prefix in ("Bearer ", "bearer ", "token ", "Token "):
+        if t.startswith(prefix):
+            t = t[len(prefix):].strip()
+    return t
+
+
 def fetch_log(repo: str, path: str, branch: str, token_secret: str = "GITHUB_TOKEN") -> Tuple[Dict[str, Any], str]:
+    """Tries the app's own token first, then the main GITHUB_TOKEN if that one is rejected."""
+    tried = []
+    result: Tuple[Dict[str, Any], str] = ({}, "GITHUB_TOKEN / GITHUB_REPO not set")
+    for name in dict.fromkeys([token_secret, "GITHUB_TOKEN"]):
+        token = _clean_token(_secret(name))
+        if not token or token in tried:
+            continue
+        tried.append(token)
+        result = _fetch_log(repo, path, branch, token)
+        if result[1] not in ("token rejected (401)", "no_access"):
+            return result
+    return result
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_log(repo: str, path: str, branch: str, token: str) -> Tuple[Dict[str, Any], str]:
     """(data, status). status: 'ok', 'missing' (file not created yet), 'no_access' (repo not visible to this token)
     or an error message. Cached 5 minutes."""
-    token = _secret(token_secret)
     if not (token and repo):
         return {}, "GITHUB_TOKEN / GITHUB_REPO not set"
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
@@ -408,7 +431,7 @@ with st.sidebar:
                    " GITHUB_TOKEN and GITHUB_REPO in its own Secrets, and that it's the same repo shown here.")
     st.caption(f"Updated {now.strftime('%H:%M')}. Refreshes every 5 minutes.")
     if st.button("↻ Refresh now", **FULL_WIDTH):
-        fetch_log.clear()
+        _fetch_log.clear()
         st.rerun()
     if not _secret("ZOHO_ORG"):
         st.caption("💡 Add ZOHO_ORG to Secrets (the bit after /crm/ in your Zoho address, e.g. org20123456) so Zoho links"
