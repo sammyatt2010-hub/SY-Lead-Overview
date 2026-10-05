@@ -86,8 +86,8 @@ html,body,[class*="css"],.stApp,button,input,textarea,select{font-family:'Inter'
 .pe-brand{display:flex;align-items:center;gap:12px;padding:4px 0 18px;border-bottom:1px solid var(--border);margin-bottom:16px}
 .pe-brand .n{font-weight:800;color:var(--text);letter-spacing:-.02em}.pe-brand .s{font-size:.74rem;color:var(--muted)}
 .pe-side-h{font-size:.7rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--faint);margin:18px 0 8px}
-.pe-status{display:flex;justify-content:space-between;align-items:center;font-size:.84rem;color:var(--text);padding:6px 0}
-.pe-status .st{font-size:.74rem;font-weight:600;display:inline-flex;align-items:center;gap:6px}
+.pe-status{display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:.84rem;color:var(--text);padding:6px 0}
+.pe-status .st{font-size:.74rem;font-weight:600;display:inline-flex;align-items:center;gap:6px;white-space:nowrap;flex-shrink:0}
 .pe-status .st::before{content:"";width:7px;height:7px;border-radius:50%;background:currentColor}
 .pe-status .ok{color:var(--good)}.pe-status .idle{color:var(--faint)}.pe-status .off{color:var(--bad)}
 /* KPI tiles: coloured top edge = the app */
@@ -195,25 +195,33 @@ if not check_password():
 # ==========================================
 def source_list() -> List[Dict[str, str]]:
     """Where each app keeps its log. Same secret names as the apps, so overrides carry across."""
-    default_repo = _secret("GITHUB_REPO")
+    default_repo, default_tok = _secret("GITHUB_REPO"), "GITHUB_TOKEN"
     pe = _secret("PE_GITHUB_REPO", default_repo)
     lr = _secret("LR_GITHUB_REPO", default_repo)
     cg = _secret("CG_GITHUB_REPO", default_repo)
+    # Each app can have its own token (e.g. paste each app's own GITHUB_TOKEN); falls back to GITHUB_TOKEN
+    pe_t = "PE_GITHUB_TOKEN" if _secret("PE_GITHUB_TOKEN") else default_tok
+    lr_t = "LR_GITHUB_TOKEN" if _secret("LR_GITHUB_TOKEN") else default_tok
+    cg_t = "CG_GITHUB_TOKEN" if _secret("CG_GITHUB_TOKEN") else default_tok
     return [
-        {"key": "pe_sent", "label": "Prospect Engine · emails", "repo": pe, "path": _secret("GITHUB_LOG_PATH", "sent_log.json")},
-        {"key": "pe_zoho", "label": "Prospect Engine · Zoho leads", "repo": pe,
+        {"key": "pe_sent", "app": "Prospect Engine", "label": "Prospect emails", "repo": pe, "tok": pe_t,
+         "path": _secret("GITHUB_LOG_PATH", "sent_log.json")},
+        {"key": "pe_zoho", "app": "Prospect Engine", "label": "Prospects added to Zoho", "repo": pe, "tok": pe_t,
          "path": _secret("GITHUB_ZOHO_LEADS_PATH", "zoho_leads.json")},
-        {"key": "lr_sent", "label": "Lead Revival · emails", "repo": lr, "path": _secret("GITHUB_CRM_LOG_PATH", "crm_sent_log.json")},
-        {"key": "cg_sent", "label": "Customer Growth · upsell", "repo": cg, "path": _secret("GITHUB_CG_LOG_PATH", "cg_sent_log.json")},
-        {"key": "cg_camp", "label": "Customer Growth · campaigns", "repo": cg,
+        {"key": "lr_sent", "app": "Lead Revival", "label": "Lead Revival emails", "repo": lr, "tok": lr_t,
+         "path": _secret("GITHUB_CRM_LOG_PATH", "crm_sent_log.json")},
+        {"key": "cg_sent", "app": "Customer Growth", "label": "Upsell emails", "repo": cg, "tok": cg_t,
+         "path": _secret("GITHUB_CG_LOG_PATH", "cg_sent_log.json")},
+        {"key": "cg_camp", "app": "Customer Growth", "label": "Campaign emails", "repo": cg, "tok": cg_t,
          "path": _secret("GITHUB_CG_CAMPAIGN_PATH", "cg_campaign_log.json")},
     ]
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_log(repo: str, path: str, branch: str) -> Tuple[Dict[str, Any], str]:
-    """(data, status). status: 'ok', 'missing' (file not created yet) or an error message. Cached 5 minutes."""
-    token = _secret("GITHUB_TOKEN")
+def fetch_log(repo: str, path: str, branch: str, token_secret: str = "GITHUB_TOKEN") -> Tuple[Dict[str, Any], str]:
+    """(data, status). status: 'ok', 'missing' (file not created yet), 'no_access' (repo not visible to this token)
+    or an error message. Cached 5 minutes."""
+    token = _secret(token_secret)
     if not (token and repo):
         return {}, "GITHUB_TOKEN / GITHUB_REPO not set"
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
@@ -222,7 +230,9 @@ def fetch_log(repo: str, path: str, branch: str) -> Tuple[Dict[str, Any], str]:
     try:
         resp = requests.get(url, headers=headers, params={"ref": branch}, timeout=15)
         if resp.status_code == 404:
-            return {}, "missing"
+            # Is it the file that's missing, or can this token not see the repo at all?
+            repo_resp = requests.get(f"https://api.github.com/repos/{repo}", headers=headers, timeout=15)
+            return {}, ("missing" if repo_resp.status_code == 200 else "no_access")
         if resp.status_code != 200:
             return {}, {401: "token rejected (401)", 403: "no permission (403)"}.get(resp.status_code, f"error {resp.status_code}")
         payload = resp.json()
@@ -340,7 +350,7 @@ logs: Dict[str, Dict[str, Any]] = {}
 status: Dict[str, str] = {}
 with st.spinner("Reading the apps' logs…"):
     for s in sources:
-        logs[s["key"]], status[s["key"]] = fetch_log(s["repo"], s["path"], branch)
+        logs[s["key"]], status[s["key"]] = fetch_log(s["repo"], s["path"], branch, s["tok"])
 events = build_events(logs)
 
 now = datetime.now(UK)
@@ -375,15 +385,27 @@ with st.sidebar:
             badge = f'<span class="st ok">{n:,} records</span>'
         elif stt == "missing":
             badge = '<span class="st idle">Nothing yet</span>'
+        elif stt == "no_access":
+            badge = '<span class="st off">Can\'t see repo</span>'
         else:
             badge = f'<span class="st off">{esc(stt)}</span>'
-        rows_html.append(f'<div class="pe-status" title="{esc(s["repo"])}/{esc(s["path"])}">{esc(s["label"])}{badge}</div>')
+        rows_html.append(f'<div class="pe-status" title="{esc(s["repo"])}/{esc(s["path"])}"><span>{esc(s["label"])}'
+                         f'<br><span style="font-size:.68rem;color:var(--faint)">{esc(s["repo"] or "no repo set")} · '
+                         f'{esc(s["path"])}</span></span>{badge}</div>')
     render_html("".join(rows_html))
-    errors = [s for s in sources if status[s["key"]] not in ("ok", "missing")]
+    blocked = [s for s in sources if status[s["key"]] == "no_access"]
+    if blocked:
+        apps_b = sorted({s["app"] for s in blocked})
+        st.caption("⚠️ The token can't see the repo for " + " and ".join(apps_b) + ". Either add that app's repo with "
+                   + ", ".join({"Prospect Engine": "PE_GITHUB_REPO", "Lead Revival": "LR_GITHUB_REPO",
+                                "Customer Growth": "CG_GITHUB_REPO"}[a] for a in apps_b)
+                   + " (and its token with the matching _GITHUB_TOKEN), or give this token access to that repo.")
+    errors = [s for s in sources if status[s["key"]] not in ("ok", "missing", "no_access")]
     if errors:
-        st.caption("⚠️ Check GITHUB_TOKEN can read: " + ", ".join(sorted({s['repo'] or '(no repo)' for s in errors})))
+        st.caption("⚠️ Check the GitHub token for: " + ", ".join(sorted({s['repo'] or '(no repo)' for s in errors})))
     if any(status[s["key"]] == "missing" for s in sources):
-        st.caption("'Nothing yet' means that app hasn't saved anything to GitHub yet (or uses a different repo).")
+        st.caption("'Nothing yet': the repo is fine but that app hasn't saved that file there yet. Check the app has"
+                   " GITHUB_TOKEN and GITHUB_REPO in its own Secrets, and that it's the same repo shown here.")
     st.caption(f"Updated {now.strftime('%H:%M')}. Refreshes every 5 minutes.")
     if st.button("↻ Refresh now", **FULL_WIDTH):
         fetch_log.clear()
@@ -423,9 +445,7 @@ cg_total, cg_today = cg_up + cg_camp, count("Customer Growth", ["Upsell email", 
 
 
 def kpi(app: str, label: str, today_v: int, total_v: int, foot: str, single: bool = False) -> str:
-    body = (f'<div class="row"><div><div class="v big">{total_v:,}</div><div class="k">Total</div></div>'
-            f'<div><div class="v">{today_v:,}</div><div class="k">Today</div></div></div>') if single else (
-            f'<div class="row"><div><div class="v big">{today_v:,}</div><div class="k">Today</div></div>'
+    body = (f'<div class="row"><div><div class="v big">{today_v:,}</div><div class="k">Today</div></div>'
             f'<div><div class="v">{total_v:,}</div><div class="k">Total</div></div></div>')
     return (f'<div class="lo-kpi" style="--c:{APPS[app]}"><div class="app"><i></i>{esc(app)}</div>'
             f'<div class="l">{esc(label)}</div>{body}<div class="foot">{esc(foot)}</div></div>')
@@ -434,7 +454,7 @@ def kpi(app: str, label: str, today_v: int, total_v: int, foot: str, single: boo
 render_html(
     '<div class="lo-kpis">'
     + kpi("Prospect Engine", "New prospects added to Zoho", pe_added_today, pe_added_total,
-          "New leads only. Firms already in Zoho aren't counted.", single=True)
+          "New leads only. Firms already in Zoho aren't counted.")
     + kpi("Prospect Engine", "New prospects emailed", pe_em_today, pe_em_total, "Pitch emails to new firms")
     + kpi("Lead Revival", "Lead revivals emailed", lr_today, lr_total, "Old Zoho leads re-contacted")
     + kpi("Customer Growth", "Customer growth emails", cg_today, cg_total, f"{cg_up:,} upsell · {cg_camp:,} campaign")
@@ -520,22 +540,24 @@ with st.container(key="card-table"):
 
     st.caption(f"Showing {len(view):,} of {len(events):,} records.")
     show = view.copy()
-    show["When"] = show["When"].apply(lambda d: d.strftime("%d %b %Y %H:%M") if d else "")
+    show["When"] = show["When"].apply(
+        lambda d: "" if not d else d.strftime("Today %H:%M") if d.date() == today
+        else d.strftime("%a %d %b %H:%M") if d.year == today.year else d.strftime("%d %b %Y"))
     show["App"] = show["App"].map({"Prospect Engine": "🔵 Prospect Engine", "Lead Revival": "🟠 Lead Revival",
                                    "Customer Growth": "🟢 Customer Growth"})
     table_kwargs = dict(
         hide_index=True, height=min(38 + 35 * max(len(show), 1), 620),
         column_order=["When", "App", "Activity", "Firm", "Contact", "Email", "Detail", "By", "How", "Zoho"],
         column_config={
-            "When": st.column_config.TextColumn("When", width="small"),
-            "App": st.column_config.TextColumn("App", width="small"),
-            "Activity": st.column_config.TextColumn("Activity", width="small"),
+            "When": st.column_config.TextColumn("When", width=128),
+            "App": st.column_config.TextColumn("App", width=165),
+            "Activity": st.column_config.TextColumn("Activity", width=125),
             "Firm": st.column_config.TextColumn("Firm / customer", width="medium"),
             "Contact": st.column_config.TextColumn("Contact", width="small"),
             "Email": st.column_config.TextColumn("Email", width="medium"),
             "Detail": st.column_config.TextColumn("Subject / detail", width="large"),
             "By": st.column_config.TextColumn("By", width="small"),
-            "How": st.column_config.TextColumn("How", width="small"),
+            "How": st.column_config.TextColumn("How", width=150),
             "Zoho": st.column_config.LinkColumn("Zoho", width="small", display_text="Open ↗"),
         },
     )
@@ -557,7 +579,8 @@ with st.container(key="card-table"):
 #   GITHUB_REPO    = "sammyatt2010-hub/prospect-engine-data"
 # Optional:
 #   ZOHO_ORG       = "org20123456"        # from your Zoho address: crm.zoho.eu/crm/<this>/...
-#   PE_GITHUB_REPO / LR_GITHUB_REPO / CG_GITHUB_REPO   # only if an app saves to a different repo
+#   PE_GITHUB_REPO / LR_GITHUB_REPO / CG_GITHUB_REPO      # only if an app saves to a different repo
+#   PE_GITHUB_TOKEN / LR_GITHUB_TOKEN / CG_GITHUB_TOKEN   # that app's own token, if GITHUB_TOKEN can't see its repo
 #   GITHUB_LOG_PATH, GITHUB_ZOHO_LEADS_PATH, GITHUB_CRM_LOG_PATH, GITHUB_CG_LOG_PATH, GITHUB_CG_CAMPAIGN_PATH
 #                                          # only if you changed a file name in one of the apps
 # ==========================================
