@@ -242,6 +242,10 @@ def source_list() -> List[Dict[str, str]]:
          "repo": _secret("SV_GITHUB_REPO", default_repo),
          "tok": "SV_GITHUB_TOKEN" if _secret("SV_GITHUB_TOKEN") else default_tok,
          "path": _secret("GITHUB_SURVEY_PATH", "survey_responses.json")},
+        {"key": "xm_resp", "app": "Customer Growth", "label": "Christmas hours replies", "repo": cg, "tok": cg_t,
+         "path": _secret("GITHUB_XMAS_PATH", "xmas_responses.json")},
+        {"key": "xm_setup", "app": "Customer Growth", "label": "Christmas hours set up", "repo": cg, "tok": cg_t,
+         "path": _secret("GITHUB_CG_XMAS_SETUP_PATH", "cg_xmas_setup.json")},
     ]
 
 
@@ -429,6 +433,25 @@ def build_events(logs: Dict[str, Dict[str, Any]]) -> pd.DataFrame:
                      "Detail": f"Campaign {cid[1:]}: {name}" if cid.startswith("m") else f"🎄 {name}", "By": r.get("sent_by") or "", "How": "Sent from Zoho",
                      "Zoho": zoho_url("Accounts", r.get("account_id"))})
 
+    # Christmas opening hours: customers' replies (survey app) and the engineers' "set up" ticks (Customer Growth)
+    for key, r in logs.get("xm_resp", {}).items():
+        if not isinstance(r, dict):
+            continue
+        rows.append({"When": parse_when(r.get("submitted_at")), "App": "Customer Growth", "Activity": "Christmas hours replied",
+                     "Sector": "", "Firm": r.get("company") or "", "Contact": r.get("contact") or "",
+                     "Email": r.get("email") or "", "Detail": "🎄 " + (r.get("summary") or "")
+                     + (f" · ticket #{r['ticket_number']}" if r.get("ticket_number") else ""),
+                     "By": "Customer", "How": "Christmas form", "Zoho": zoho_url("Accounts", r.get("account_id"))})
+    replies = logs.get("xm_resp", {})
+    for aid, r in logs.get("xm_setup", {}).items():
+        if not isinstance(r, dict) or not r.get("done"):
+            continue
+        rep_ = replies.get(aid) or {}
+        rows.append({"When": parse_when(r.get("at")), "App": "Customer Growth", "Activity": "Christmas hours set up",
+                     "Sector": "", "Firm": rep_.get("company") or "", "Contact": rep_.get("contact") or "",
+                     "Email": rep_.get("email") or "", "Detail": "🎄 Set up on the phone system", "By": r.get("by") or "",
+                     "How": "Customer Growth", "Zoho": zoho_url("Accounts", aid)})
+
     # MY PA: free 1-week trial emails, keyed by the Zoho lead id
     for key, r in logs.get("mp_sent", {}).items():
         if not isinstance(r, dict) or not is_email(r):
@@ -506,7 +529,27 @@ def week_stats(ev: pd.DataFrame, end: date, eng: Optional[pd.DataFrame] = None) 
         "eng": _week_eng(eng, start, end),
         "eng_detail": _week_eng_detail(eng, start, end),
         "survey": _week_survey(ev, d, start, end, prev_start, days),
+        "xmas": _week_xmas(ev, cur),
     }
+
+
+def _week_xmas(ev: pd.DataFrame, cur: pd.DataFrame) -> Optional[Dict[str, int]]:
+    """Christmas opening hours: emails sent, replies and set-ups, this week and all time."""
+    def n(df: pd.DataFrame, act: str, detail: Optional[str] = None) -> int:
+        m = df["Activity"] == act
+        if detail:
+            m &= df["Detail"] == detail
+        return int(m.sum())
+    sent_all = n(ev, "Campaign email", "🎄 Christmas opening hours")
+    rep_all = n(ev, "Christmas hours replied")
+    if not (sent_all or rep_all):
+        return None
+    return {"sent": n(cur, "Campaign email", "🎄 Christmas opening hours"), "sent_all": sent_all,
+            "replied": n(cur, "Christmas hours replied"), "replied_all": rep_all,
+            "setup": n(cur, "Christmas hours set up"), "setup_all": n(ev, "Christmas hours set up"),
+            "todo": max(0, rep_all - int(((ev["Activity"] == "Christmas hours replied")
+                                          & ev["Detail"].str.contains("Open as normal", regex=False)).sum())
+                        - n(ev, "Christmas hours set up"))}
 
 
 def _week_survey(ev: pd.DataFrame, d: pd.DataFrame, start: date, end: date, prev_start: date,
@@ -602,6 +645,13 @@ def weekly_text(ws: Dict[str, Any]) -> str:
         lines += ["", "Top sectors pitched: " + ", ".join(f"{k} ({v})" for k, v in ws["sectors"])]
     if ws["campaigns"]:
         lines.append("Customer campaigns sent: " + ", ".join(f"{k} ({v})" for k, v in ws["campaigns"]))
+    xm = ws.get("xmas")
+    if xm:
+        lines += ["", "Christmas opening hours:",
+                  f"- {xm['sent']:,} Christmas emails sent this week ({xm['sent_all']:,} in total)",
+                  f"- {xm['replied']:,} customers replied this week ({xm['replied_all']:,} in total)",
+                  f"- {xm['setup']:,} set up on the phone system this week ({xm['setup_all']:,} in total);"
+                  f" {xm['todo']:,} still to set up"]
     sv = ws.get("survey")
     if sv:
         lines += ["", "Quote surveys:"]
@@ -1727,6 +1777,10 @@ def weekly_pdf(ws: Dict[str, Any]) -> bytes:
         bullets.append(f"{ws['trials']:,} businesses offered a free 1-week MY PA Connect trial.")
     if ws.get("eng"):
         bullets.append(eng_sentence(ws["eng"]))
+    if ws.get("xmas"):
+        xm = ws["xmas"]
+        bullets.append(f"Christmas hours: {xm['sent']:,} emails sent, {xm['replied']:,} replies and {xm['setup']:,} set up"
+                       f" this week; {xm['todo']:,} still to set up.")
     if ws.get("survey") and (ws["survey"]["sent"] or ws["survey"]["done"]):
         bullets.append(f"{ws['survey']['sent']:,} quote surveys sent and {ws['survey']['done']:,} completed by customers"
                        " (details on the Quote surveys page).")
@@ -2411,6 +2465,11 @@ with st.sidebar:
             badge = '<span class="st off">Can\'t see repo</span>'
         else:
             badge = f'<span class="st off">{esc(stt)}</span>'
+        if s["key"] == "xm_resp":  # Christmas emails live in Customer Growth's campaign log
+            _n_x = sum(1 for k, r in logs.get("cg_camp", {}).items()
+                       if isinstance(r, dict) and str(r.get("campaign") or k.split("|")[0]) == "x01")
+            rows_html.append(f'<div class="pe-status"><span>Christmas hours emails</span>'
+                             f'<span class="st {"ok" if _n_x else "idle"}">{_n_x:,} sent</span></div>')
         if s["key"] == "sv_resp":  # Surveys sent live inside the Prospect Engine / Lead Revival logs
             _n_sent = len(survey_links(logs)[0])
             rows_html.append(f'<div class="pe-status"><span>Quote surveys sent</span>'
@@ -2513,6 +2572,20 @@ if len(_sv_sent) or len(_sv_done):
     render_html('<div class="lo-totals">'
                 + total_card("Quote survey", "Surveys sent", _sv_sent)
                 + total_card("Quote survey", "Surveys completed" + _sv_rate, _sv_done)
+                + "</div>")
+
+_xm_sent = (events[(events["Activity"] == "Campaign email") & events["Detail"].eq("🎄 Christmas opening hours")]
+            if not events.empty else events)
+_xm_rep = events[events["Activity"] == "Christmas hours replied"] if not events.empty else events
+if len(_xm_sent) or len(_xm_rep):
+    _accts_sent = {str(r.get("account_id")) for k, r in logs.get("cg_camp", {}).items()
+                   if isinstance(r, dict) and str(r.get("campaign") or k.split("|")[0]) == "x01"}
+    _accts_rep = {str(r.get("account_id") or k) for k, r in logs.get("xm_resp", {}).items() if isinstance(r, dict)}
+    _n_setup = sum(1 for r in logs.get("xm_setup", {}).values() if isinstance(r, dict) and r.get("done"))
+    _xm_rate = f" · {round(100 * len(_accts_rep & _accts_sent) / len(_accts_sent))}% replied" if _accts_sent else ""
+    render_html('<div class="lo-totals">'
+                + total_card("🎄 Christmas hours", "Emails sent", _xm_sent)
+                + total_card("🎄 Christmas hours", f"Replies{_xm_rate} · {_n_setup} set up", _xm_rep)
                 + "</div>")
 
 render_html(
